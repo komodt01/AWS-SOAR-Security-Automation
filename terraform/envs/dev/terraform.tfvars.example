@@ -1,0 +1,23 @@
+# terraform/envs/dev/terraform.tfvars
+# Copy this file to terraform.tfvars and fill in your values
+# Never commit terraform.tfvars — it is in .gitignore
+
+aws_region   = "us-east-1"
+environment  = "dev"
+project_name = "soar"
+
+# Email for SOC alert notifications (will receive a confirmation email from SNS)
+alert_email = "email@msn.com"
+
+# Set to false if GuardDuty or Security Hub is already enabled in your account
+enable_guardduty    = true
+enable_security_hub = true
+
+# GuardDuty finding frequency
+# FIFTEEN_MINUTES = real-time demo  |  ONE_HOUR = normal dev  |  SIX_HOURS = cost-optimized
+guardduty_finding_frequency = "FIFTEEN_MINUTES"
+
+# Retention periods
+cloudtrail_retention_days = 90
+audit_s3_retention_days   = 90
+lambda_log_retention_days = 30

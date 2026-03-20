@@ -1,0 +1,203 @@
+name: Terraform SOAR Pipeline CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'lambda/**'
+      - '.github/workflows/terraform.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'lambda/**'
+
+env:
+  TF_VERSION: "1.7.0"
+  PYTHON_VERSION: "3.12"
+  AWS_REGION: "us-east-1"
+  TF_VAR_FILE: "envs/dev/terraform.tfvars"
+
+permissions:
+  contents: read
+  pull-requests: write   # Allows posting plan output as PR comment
+  id-token: write        # Required for OIDC authentication with AWS
+
+jobs:
+  # ─── VALIDATE LAMBDA CODE ─────────────────────────────────────────────────
+  validate-lambda:
+    name: Validate Lambda Functions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install linting tools
+        run: pip install flake8 bandit
+
+      - name: Lint — flake8
+        run: |
+          flake8 lambda/ \
+            --max-line-length=120 \
+            --exclude=lambda/dist \
+            --statistics
+        continue-on-error: false
+
+      - name: Security scan — bandit
+        run: |
+          bandit -r lambda/ \
+            --exclude lambda/dist \
+            --severity-level medium \
+            --confidence-level medium \
+            -f text
+        continue-on-error: false
+
+      - name: Syntax check all Lambda handlers
+        run: |
+          for handler in lambda/*/handler.py; do
+            echo "Checking: $handler"
+            python -m py_compile "$handler" && echo "  OK" || exit 1
+          done
+
+  # ─── TERRAFORM VALIDATE AND PLAN ──────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: validate-lambda
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # OIDC-based AWS authentication (preferred over long-lived keys)
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda functions
+        working-directory: .
+        run: |
+          mkdir -p lambda/dist
+          for dir in lambda/*/; do
+            name=$(basename "$dir")
+            if [[ "$name" != "dist" ]]; then
+              echo "Packaging: $name"
+              cd "lambda/$name"
+              zip -r "../dist/${name}.zip" . -x "__pycache__/*" "*.pyc"
+              cd ../..
+            fi
+          done
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="${{ env.TF_VAR_FILE }}" \
+            -no-color \
+            -out=tfplan \
+            2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Post Plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+            const truncated = planOutput.length > 60000
+              ? planOutput.substring(0, 60000) + '\n...[truncated]'
+              : planOutput;
+
+            const status = '${{ steps.plan.outcome }}' === 'success' ? '✅' : '❌';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${status} Terraform Plan\n\n<details><summary>Show Plan</summary>\n\n\`\`\`terraform\n${truncated}\n\`\`\`\n</details>`
+            });
+
+      - name: Fail if plan failed
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # ─── TERRAFORM APPLY (main branch only) ────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    environment:
+      name: dev
+      url: https://console.aws.amazon.com/states/home?region=us-east-1
+
+    defaults:
+      run:
+        working-directory: terraform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda functions
+        working-directory: .
+        run: |
+          mkdir -p lambda/dist
+          for dir in lambda/*/; do
+            name=$(basename "$dir")
+            if [[ "$name" != "dist" ]]; then
+              cd "lambda/$name"
+              zip -r "../dist/${name}.zip" . -x "__pycache__/*" "*.pyc"
+              cd ../..
+            fi
+          done
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: |
+          terraform apply \
+            -var-file="${{ env.TF_VAR_FILE }}" \
+            -auto-approve \
+            -no-color
