@@ -4,9 +4,7 @@
 CloudTrail logging to a versioned S3 bucket creates two compounding cost 
 drivers: continuous log growth from high-frequency event capture, and 
 version retention that preserves every prior copy of every object 
-indefinitely by default. Left unmanaged, storage cost grows in a way that 
-isn't visible from the current-state view of the bucket, since the 
-console shows the latest version, not the accumulated history behind it.
+indefinitely by default. Left unmanaged, storage cost can grow in ways that are not obvious from the default current-object view of the bucket, because noncurrent versions must be explicitly surfaced and accounted for.
 
 ## Why This Was Missed Initially
 Billing alarms were in place, but they alert on spend thresholds after 
