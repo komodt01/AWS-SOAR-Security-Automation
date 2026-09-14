@@ -1,0 +1,397 @@
+# Technical Case Study — AWS SOAR Security Automation
+
+## Overview
+
+This project explores how I would structure an event-driven security response
+architecture in AWS when the goal is to automate containment without turning
+the automation itself into an uncontrolled security risk.
+
+The architecture connects GuardDuty, Security Hub, EventBridge, Step Functions,
+Lambda, SNS, CloudTrail, and S3.
+
+I implemented two response scenarios:
+
+- IAM credential compromise
+- EC2 workload isolation
+
+The important part of the project was not simply getting Lambda functions to
+perform remediation actions. I wanted the response process to include
+enrichment, controlled permissions, failure handling, analyst notification,
+and evidence generation.
+
+I also encountered an operational problem with the versioned S3 audit bucket
+that changed part of the architecture. That became an important lesson in
+designing security controls together with their operational lifecycle.
+
+---
+
+## Architecture
+
+The primary event path is:
+
+**GuardDuty → Security Hub → EventBridge → Step Functions → Lambda**
+
+Supporting services provide:
+
+- SNS notification and analyst escalation
+- CloudTrail activity logging
+- S3 storage for audit logs and SOAR execution artifacts
+- CloudWatch logging for Lambda and Step Functions
+- KMS encryption for GuardDuty findings export
+
+I used Step Functions as the orchestration layer rather than embedding the
+entire response process inside a single Lambda function.
+
+For this scenario, that separation made the response easier to reason about.
+Enrichment, notification, containment, escalation, and audit writing are
+distinct stages with their own failure behavior.
+
+---
+
+## Design Decision 1 — Enrich Before Acting
+
+A security finding provides the trigger, but I did not want the containment
+decision to rely only on the original alert.
+
+The enrichment Lambda retrieves current information about the affected
+resource before remediation begins.
+
+For IAM findings, this includes information such as:
+
+- IAM user metadata
+- Active access keys
+- Attached and inline policies
+- Console-login configuration
+
+For EC2 findings, enrichment includes:
+
+- Instance state and configuration
+- VPC and subnet
+- Network addresses
+- Security groups
+- IAM instance profile
+- Attached EBS volumes
+- Resource tags
+
+The reason I chose this pattern is that detection context and current resource
+state are not necessarily the same thing.
+
+In a production implementation, I would take this further by evaluating
+whether the enrichment data should influence an automated decision or whether
+certain conditions should require analyst approval before containment.
+
+---
+
+## Design Decision 2 — Separate the Response Playbooks
+
+IAM credential compromise and EC2 compromise represent different containment
+problems, so I kept them as separate Step Functions workflows.
+
+### IAM Credential Compromise
+
+The IAM response performs the following sequence:
+
+1. Enrich the finding.
+2. Notify the security team.
+3. Disable active IAM user access keys.
+4. Apply an emergency deny policy to the affected IAM user.
+5. Tag the user to indicate quarantine status.
+6. Evaluate the remediation result.
+7. Escalate partial or failed actions.
+8. Write the execution result to the audit store.
+
+I deliberately scoped the response to the affected IAM user.
+
+This does not claim to invalidate every possible AWS session. Federated
+sessions, IAM Identity Center sessions, assumed roles, and other identity
+paths would require additional response logic.
+
+That distinction matters because an automated response should be explicit
+about what it actually contains.
+
+### EC2 Isolation
+
+The EC2 response performs a different sequence:
+
+1. Enrich the finding.
+2. Notify the security team.
+3. Initiate EBS snapshots for investigation and preservation.
+4. Create or reuse a restrictive quarantine security group.
+5. Replace the instance security groups with the quarantine group.
+6. Evaluate the isolation result.
+7. Escalate partial or failed actions.
+8. Write the execution result to the audit store.
+
+I describe this as containment rather than complete network isolation.
+
+Security groups are only one part of an AWS network architecture. A production
+response design would need to consider the specific workload, existing network
+controls, IPv6, service dependencies, management paths, and whether stronger
+containment mechanisms are required.
+
+---
+
+## Design Decision 3 — Orchestrate Failure Paths Explicitly
+
+One of the architecture goals was to avoid treating automation as a simple
+success path.
+
+Step Functions provides retry, catch, choice, and escalation behavior around
+the Lambda actions.
+
+The workflow distinguishes between successful and partial response results.
+Failures can be routed to the SOC notification path instead of silently
+terminating the automation.
+
+This was important because containment automation can fail for legitimate
+reasons:
+
+- Resource state may have changed.
+- Permissions may be insufficient.
+- A service API may fail temporarily.
+- Only part of a multi-step response may succeed.
+- The finding may not match the assumptions built into the playbook.
+
+For this scenario, I would rather surface an incomplete response to an analyst
+than treat the workflow execution itself as proof that containment succeeded.
+
+---
+
+## Design Decision 4 — Separate Permissions by Function
+
+I used separate Lambda execution roles rather than giving the SOAR system one
+broad administrative role.
+
+The permissions are divided according to function:
+
+- Enrichment receives read-oriented IAM and EC2 permissions.
+- Notification receives permission to publish to the SOC SNS topic.
+- IAM remediation receives the permissions required to disable keys, apply the
+  emergency policy, and tag the affected user.
+- EC2 isolation receives the permissions required for snapshots, security-group
+  changes, and tagging.
+- Audit writing receives access to the designated S3 evidence location.
+
+Where practical, the permissions are also scoped to the resources used by the
+architecture.
+
+I also used explicit denies around destructive actions that the response
+functions should not perform.
+
+The architectural goal was to constrain the blast radius of the automation
+itself.
+
+A compromised or malfunctioning remediation function should not automatically
+inherit every permission required by every other response playbook.
+
+---
+
+## Design Decision 5 — Keep Human Escalation in the Architecture
+
+I did not design the system around the assumption that SOAR eliminates the
+analyst.
+
+SNS provides a notification path for initial response information and
+escalation when automated actions are incomplete or fail.
+
+For a production environment, I would expect the escalation path to integrate
+with the organization's actual SOC workflow, such as a SIEM, case-management
+platform, incident-response platform, or ticketing system.
+
+Some response actions might also require approval before execution depending
+on business criticality and the organization's risk tolerance.
+
+The point of automation is to reduce response time and perform predictable
+actions consistently, not to remove human judgment from every incident.
+
+---
+
+## Design Decision 6 — Generate Evidence as Part of the Workflow
+
+The `write_audit` function creates a structured execution artifact in S3.
+
+The artifact can contain:
+
+- Original finding information
+- Enrichment context
+- Response results
+- Notification information
+- Escalation information
+- Execution metadata
+
+I wanted evidence generation to be part of the response workflow rather than
+something reconstructed later from disconnected logs.
+
+This does not mean that an S3 artifact by itself proves compliance with a
+specific framework.
+
+Instead, it provides structured evidence that could support incident review,
+auditability, operational analysis, and a broader compliance evidence process.
+
+---
+
+## The S3 Lifecycle Problem
+
+The audit architecture produced the most important operational lesson in the
+project.
+
+CloudTrail was writing audit data into a versioned S3 bucket.
+
+Over time, the bucket accumulated more than 145,000 current and noncurrent
+objects.
+
+During Terraform teardown, the bucket appeared to be empty from a normal
+object view, but retained object versions and delete markers still existed.
+
+Because those retained versions remained, Terraform could not delete the
+bucket successfully.
+
+At first glance this looked like an Infrastructure as Code problem.
+
+It was actually an architecture lifecycle problem.
+
+Versioning had been introduced for security and audit purposes, but the design
+had not sufficiently accounted for:
+
+- Noncurrent object retention
+- Delete markers
+- Long-term storage growth
+- Teardown behavior
+- Cleanup at scale
+- Operational cost
+
+---
+
+## Correcting the Design
+
+I used batched cleanup to remove the existing retained versions and restore
+the ability to tear down the environment.
+
+More importantly, I changed the architecture so the same issue was not simply
+left for the next teardown.
+
+The S3 lifecycle configuration now explicitly accounts for both current and
+noncurrent object versions.
+
+I also narrowed CloudTrail S3 data-event monitoring to the SOAR
+`playbook-artifacts/` path rather than monitoring the entire audit bucket.
+
+That decision reduces unnecessary logging and avoids creating an overly broad
+data-event collection pattern around the bucket receiving security telemetry.
+
+This changed how I looked at the logging control.
+
+The original question was:
+
+**How do I preserve security evidence?**
+
+The better architecture question became:
+
+**How do I preserve the evidence I need while also defining its lifecycle,
+operational behavior, and cost?**
+
+---
+
+## Security Tradeoffs
+
+Several controls in this project deliberately create tradeoffs.
+
+### Automation vs. Blast Radius
+
+Faster automated containment reduces response time, but privileged automation
+can itself become a security risk.
+
+I addressed this through separate execution roles, scoped permissions,
+explicit workflow stages, and analyst escalation.
+
+### Preservation vs. Lifecycle
+
+Versioning helps preserve audit data, but indefinite retention increases cost
+and complicates resource lifecycle management.
+
+Retention therefore needs to be an explicit architecture decision rather than
+an accidental result of enabling versioning.
+
+### Isolation vs. Availability
+
+Automatically restricting an EC2 instance can contain a threat but can also
+interrupt a business service.
+
+A production design would need criteria for determining which resources can
+be isolated automatically and which require approval.
+
+### Automation vs. Human Judgment
+
+Some response actions are predictable enough to automate. Others depend on
+business context that the security finding does not contain.
+
+The architecture therefore keeps an escalation path rather than assuming every
+finding can be completely resolved by automation.
+
+---
+
+## What I Would Evaluate for Production
+
+This implementation is intentionally bounded as a portfolio architecture.
+
+Before using this pattern in an enterprise environment, I would evaluate:
+
+- Multi-account GuardDuty and Security Hub administration
+- AWS Organizations integration
+- Multi-region detection and response
+- Cross-account remediation roles
+- Federated and IAM Identity Center session containment
+- Approval gates for high-impact remediation
+- Broader EC2 network-containment mechanisms
+- Formal evidence-retention requirements
+- Central SIEM and incident-management integration
+- Dead-letter and replay strategies
+- Idempotency of remediation actions
+- Concurrency and duplicate findings
+- SLOs for detection-to-containment time
+- Monitoring of the automation platform itself
+- Recovery procedures for incorrect containment
+- Change control for response playbooks
+
+I would also separate retention policies by evidence type rather than assume
+that CloudTrail logs, GuardDuty exports, and SOAR execution artifacts all
+require the same lifecycle.
+
+---
+
+## Technical Outcome
+
+The project resulted in an AWS SOAR architecture with two working response
+patterns:
+
+**IAM compromise**
+
+GuardDuty / Security Hub  
+→ EventBridge  
+→ Step Functions  
+→ enrichment  
+→ notification  
+→ credential containment  
+→ escalation when required  
+→ S3 execution artifact
+
+**EC2 compromise**
+
+GuardDuty / Security Hub  
+→ EventBridge  
+→ Step Functions  
+→ enrichment  
+→ notification  
+→ snapshot initiation and network containment  
+→ escalation when required  
+→ S3 execution artifact
+
+The project also exposed and corrected a lifecycle weakness in the supporting
+audit architecture.
+
+The main technical lesson was that security automation cannot be evaluated
+only by whether the remediation code works.
+
+The surrounding architecture — identity, orchestration, failure handling,
+evidence, logging, lifecycle, cost, and human escalation — determines whether
+the automation can operate safely and sustainably.
