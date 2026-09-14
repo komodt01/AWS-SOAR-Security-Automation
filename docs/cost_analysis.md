@@ -18,8 +18,7 @@ invisible to standard verification steps.
   defined schedule, rather than retaining them indefinitely
 - Cost monitoring at the resource level (storage class, version count), 
   not just account-level billing alerts
-- Teardown procedures that explicitly enumerate and remove versions, 
-  since standard deletion and `terraform destroy` do not
+- Teardown procedures that explicitly account for object versions and delete markers, which can prevent deletion of a versioned bucket during terraform destroy.
 
 ## Architectural Principle
 Cost governance has to be a design-time input, not a monitoring-time 
