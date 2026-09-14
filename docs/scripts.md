@@ -4,7 +4,7 @@
 
 This project required custom scripting to resolve a real-world AWS limitation:
 
-Terraform cannot delete versioned S3 buckets containing object versions and delete markers.
+Retained object versions and delete markers can prevent a versioned S3 bucket from being deleted during Terraform teardown.
 
 To address this, a Python-based cleanup script was developed to automate the deletion of large-scale versioned objects.
 
@@ -67,7 +67,7 @@ Objects are grouped into batches:
 
 batch_size = 500
 
-This improves performance and avoids API throttling.
+This improves deletion efficiency and reduces the number of API requests compared with deleting objects individually.
 
 ---
 
@@ -121,7 +121,7 @@ python3 s3_version_cleanup.py <bucket-name>
 This script demonstrates:
 
 - Automation of cloud operational tasks
-- Handling AWS service limitations
+- Handling AWS resource lifecycle and teardown constraints
 - Scalable problem-solving for large datasets
 
 ---
@@ -139,6 +139,7 @@ This scenario commonly occurs with:
 
 ## 🚀 Future Enhancements
 
+- May require multiple passes due to AWS pagination
 - Add pagination handling for full automation
 - Integrate with AWS Lambda for event-driven cleanup
 - Add logging and retry logic
