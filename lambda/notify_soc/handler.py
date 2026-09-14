@@ -1,10 +1,12 @@
 """
 notify_soc — SOAR Playbook Step 2
-Publishes a structured alert to the SOC SNS topic.
 
-Formats the finding and enrichment context into a human-readable
-notification with severity, resource details, and recommended actions.
-Also used as the escalation handler when automated steps fail.
+Publishes structured security notifications to the configured SNS topic.
+
+The function formats finding and enrichment context into a
+human-readable alert containing severity, resource details, and
+response context. It can also publish escalation notifications when
+upstream workflow steps identify a condition requiring analyst action.
 """
 
 import boto3
@@ -18,31 +20,44 @@ logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 sns_client = boto3.client("sns")
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
 
-# Severity → emoji prefix for rapid visual triage in email/Slack
 SEVERITY_PREFIX = {
-    "CRITICAL": "🔴 [CRITICAL]",
-    "HIGH":     "🟠 [HIGH]",
-    "MEDIUM":   "🟡 [MEDIUM]",
-    "LOW":      "🟢 [LOW]",
+    "CRITICAL": "[CRITICAL]",
+    "HIGH": "[HIGH]",
+    "MEDIUM": "[MEDIUM]",
+    "LOW": "[LOW]",
 }
 
 
 def lambda_handler(event: dict, context) -> dict:
-    logger.info("notify_soc invoked | playbook=%s alert_type=%s",
-                event.get("playbook"), event.get("alert_type", "FINDING_DETECTED"))
+    logger.info(
+        "notify_soc invoked | playbook=%s alert_type=%s",
+        event.get("playbook"),
+        event.get("alert_type", "FINDING_DETECTED"),
+    )
 
-    finding    = event.get("finding", {})
-    enriched   = event.get("enriched", {})
+    finding = event.get("finding", {})
+    enriched = event.get("enriched", {})
     alert_type = event.get("alert_type", "FINDING_DETECTED")
-    severity   = event.get("severity") or finding.get("severity", "HIGH")
+    severity = event.get("severity") or finding.get("severity", "HIGH")
 
-    subject = build_subject(severity, alert_type, finding)
-    message = build_message(event, finding, enriched, alert_type, severity)
+    subject = build_subject(
+        severity,
+        alert_type,
+        finding,
+    )
+
+    message = build_message(
+        event,
+        finding,
+        enriched,
+        alert_type,
+        severity,
+    )
 
     try:
         response = sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
-            Subject=subject[:100],  # SNS subject max 100 chars
+            Subject=subject[:100],
             Message=message,
             MessageAttributes={
                 "severity": {
@@ -51,7 +66,10 @@ def lambda_handler(event: dict, context) -> dict:
                 },
                 "playbook": {
                     "DataType": "String",
-                    "StringValue": event.get("playbook", "unknown"),
+                    "StringValue": event.get(
+                        "playbook",
+                        "unknown",
+                    ),
                 },
                 "alert_type": {
                     "DataType": "String",
@@ -61,7 +79,12 @@ def lambda_handler(event: dict, context) -> dict:
         )
 
         message_id = response["MessageId"]
-        logger.info("SNS alert published | message_id=%s severity=%s", message_id, severity)
+
+        logger.info(
+            "SNS alert published | message_id=%s severity=%s",
+            message_id,
+            severity,
+        )
 
         return {
             **event,
@@ -70,23 +93,53 @@ def lambda_handler(event: dict, context) -> dict:
                 "message_id": message_id,
                 "topic_arn": SNS_TOPIC_ARN,
                 "alert_type": alert_type,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": datetime.now(
+                    timezone.utc
+                ).isoformat(),
             },
         }
 
     except Exception as exc:
-        logger.error("SNS publish failed: %s", exc, exc_info=True)
+        logger.error(
+            "SNS publish failed: %s",
+            exc,
+            exc_info=True,
+        )
         raise
 
 
-def build_subject(severity: str, alert_type: str, finding: dict) -> str:
-    prefix = SEVERITY_PREFIX.get(severity, f"[{severity}]")
-    title  = finding.get("title", "Security Finding Detected")
-    return f"{prefix} SOAR Alert: {alert_type} — {title}"
+def build_subject(
+    severity: str,
+    alert_type: str,
+    finding: dict,
+) -> str:
+    prefix = SEVERITY_PREFIX.get(
+        severity,
+        f"[{severity}]",
+    )
+
+    title = finding.get(
+        "title",
+        "Security Finding Detected",
+    )
+
+    return (
+        f"{prefix} SOAR Alert: "
+        f"{alert_type} — {title}"
+    )
 
 
-def build_message(event: dict, finding: dict, enriched: dict, alert_type: str, severity: str) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def build_message(
+    event: dict,
+    finding: dict,
+    enriched: dict,
+    alert_type: str,
+    severity: str,
+) -> str:
+    now = datetime.now(
+        timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
     lines = [
         "=" * 70,
         f"  SOAR SECURITY ALERT — {alert_type}",
@@ -107,8 +160,11 @@ def build_message(event: dict, finding: dict, enriched: dict, alert_type: str, s
         "",
     ]
 
-    # Resource context block
-    resource_type = enriched.get("resource_type", "")
+    resource_type = enriched.get(
+        "resource_type",
+        "",
+    )
+
     if resource_type == "IAM_USER":
         lines += [
             "  IAM RESOURCE CONTEXT",
@@ -117,9 +173,13 @@ def build_message(event: dict, finding: dict, enriched: dict, alert_type: str, s
             f"  User ARN         : {enriched.get('user_arn', 'N/A')}",
             f"  Active Keys      : {enriched.get('active_key_count', 'N/A')}",
             f"  Console Access   : {enriched.get('has_console_access', 'N/A')}",
-            f"  Managed Policies : {len(enriched.get('managed_policies', []))}",
+            (
+                "  Managed Policies : "
+                f"{len(enriched.get('managed_policies', []))}"
+            ),
             "",
         ]
+
     elif resource_type == "EC2_INSTANCE":
         lines += [
             "  EC2 RESOURCE CONTEXT",
@@ -130,15 +190,20 @@ def build_message(event: dict, finding: dict, enriched: dict, alert_type: str, s
             f"  VPC              : {enriched.get('vpc_id', 'N/A')}",
             f"  Private IP       : {enriched.get('private_ip', 'N/A')}",
             f"  Public IP        : {enriched.get('public_ip', 'N/A')}",
-            f"  EBS Volumes      : {len(enriched.get('ebs_volumes', []))}",
+            (
+                "  EBS Volumes      : "
+                f"{len(enriched.get('ebs_volumes', []))}"
+            ),
             "",
         ]
 
-    # Manual action if this is an escalation
-    manual_action = event.get("manual_action")
+    manual_action = event.get(
+        "manual_action"
+    )
+
     if manual_action:
         lines += [
-            "  ⚠  MANUAL ACTION REQUIRED",
+            "  MANUAL ACTION REQUIRED",
             "  " + "-" * 50,
             f"  {manual_action}",
             "",
@@ -151,7 +216,10 @@ def build_message(event: dict, finding: dict, enriched: dict, alert_type: str, s
         "  Step Functions: https://console.aws.amazon.com/states/home",
         "  GuardDuty     : https://console.aws.amazon.com/guardduty/home",
         "",
-        "  This alert was generated automatically by the AWS SOAR pipeline.",
+        (
+            "  This alert was generated automatically "
+            "by the AWS SOAR pipeline."
+        ),
         "=" * 70,
     ]
 
