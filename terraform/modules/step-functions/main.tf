@@ -1,315 +1,540 @@
 data "aws_caller_identity" "current" {}
+
 data "aws_region" "current" {}
 
+
 # ─── IAM CREDENTIAL COMPROMISE PLAYBOOK ──────────────────────────────────────
-# Playbook: UnauthorizedAccess:IAMUser/AnomalousBehavior
-# Flow: Enrich → Notify → Remediate → Choice(success|fail) → Audit
+#
+# Flow:
+# Enrich → Notify → Remediate → Evaluate → Audit
+#
+# Failure paths:
+# - Enrichment failure → SOC escalation → Fail
+# - Notification failure → record failure → continue remediation
+# - Remediation failure/partial result → SOC escalation → Audit
+# ─────────────────────────────────────────────────────────────────────────────
 
 locals {
   iam_playbook_asl = jsonencode({
     Comment = "SOAR Playbook: IAM Credential Compromise Response"
     StartAt = "EnrichFinding"
+
     States = {
+
       EnrichFinding = {
         Type     = "Task"
         Resource = var.enrich_finding_lambda_arn
-        Comment  = "Enrich finding with IAM user context (access keys, policies, login profile)"
+        Comment  = "Enrich finding with IAM user context including access keys, policies, and login profile"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.TooManyRequestsException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "EnrichFailed"
           ResultPath  = "$.error"
         }]
-        ResultPath = "$.enriched"
-        Next       = "NotifySOC"
+
+        Next = "NotifySOC"
       }
+
 
       NotifySOC = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Send HIGH severity alert to security team via SNS"
+        Comment  = "Notify the security team with finding and enrichment context"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 2
           BackoffRate     = 1.5
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "NotifyFailed"
-          ResultPath  = "$.error"
+          ResultPath  = "$.notification_error"
         }]
-        ResultPath = "$.notification"
-        Next       = "RemediateIAM"
+
+        Next = "RemediateIAM"
       }
+
 
       RemediateIAM = {
         Type     = "Task"
         Resource = var.iam_remediation_lambda_arn
-        Comment  = "Disable access keys, attach DenyAll inline policy, tag user QUARANTINE"
+        Comment  = "Disable active access keys, apply emergency explicit-deny policy, and tag the IAM user for quarantine"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 5
           MaxAttempts     = 2
           BackoffRate     = 2
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "RemediationFailed"
           ResultPath  = "$.error"
         }]
-        ResultPath = "$.remediation"
-        Next       = "CheckRemediationSuccess"
+
+        Next = "CheckRemediationStatus"
       }
 
-      CheckRemediationSuccess = {
+
+      CheckRemediationStatus = {
         Type    = "Choice"
-        Comment = "Branch on remediation outcome — success to audit, failure to escalation"
-        Choices = [{
-          Variable     = "$.remediation.status"
-          StringEquals = "SUCCESS"
-          Next         = "WriteAuditArtifact"
-        }]
+        Comment = "Evaluate the IAM remediation result"
+
+        Choices = [
+          {
+            Variable     = "$.remediation.status"
+            StringEquals = "SUCCESS"
+            Next         = "WriteAuditArtifact"
+          },
+          {
+            Variable     = "$.remediation.status"
+            StringEquals = "PARTIAL"
+            Next         = "RemediationPartial"
+          }
+        ]
+
         Default = "RemediationFailed"
       }
+
+
+      RemediationPartial = {
+        Type     = "Task"
+        Resource = var.notify_soc_lambda_arn
+        Comment  = "IAM remediation completed only partially and requires analyst review"
+
+        Parameters = {
+          "playbook.$"    = "$.playbook"
+          "finding.$"     = "$.finding"
+          "enriched.$"    = "$.enriched"
+          "remediation.$" = "$.remediation"
+
+          "alert_type" = "REMEDIATION_PARTIAL"
+          "severity"   = "CRITICAL"
+
+          "manual_action" = "Review IAM remediation results and manually complete any remaining containment actions."
+        }
+
+        ResultPath = "$.escalation"
+
+        Next = "WriteAuditArtifact"
+      }
+
 
       WriteAuditArtifact = {
         Type     = "Task"
         Resource = var.write_audit_lambda_arn
-        Comment  = "Write compliance evidence artifact to S3 — satisfies SOC2 CC4.1, FedRAMP AU-2"
+        Comment  = "Write structured playbook execution artifact to S3 for incident review and audit evidence"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
         }]
-        ResultPath = "$.audit"
-        Next       = "PlaybookSucceeded"
+
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          Next        = "AuditWriteFailed"
+          ResultPath  = "$.audit_error"
+        }]
+
+        Next = "PlaybookSucceeded"
       }
 
-      PlaybookSucceeded = {
-        Type    = "Succeed"
-        Comment = "IAM credential compromise playbook completed successfully"
-      }
 
       EnrichFailed = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Enrichment failed — notify SOC for manual investigation"
+        Comment  = "Automated enrichment failed; notify SOC for manual investigation"
+
         Parameters = {
-          "finding.$"     = "$.finding"
-          "error.$"       = "$.error"
-          "alert_type"    = "ENRICHMENT_FAILED"
-          "severity"      = "HIGH"
-          "manual_action" = "Review finding in Security Hub — automated enrichment failed"
+          "playbook.$" = "$.playbook"
+          "finding.$"  = "$.finding"
+          "error.$"    = "$.error"
+
+          "alert_type" = "ENRICHMENT_FAILED"
+          "severity"   = "HIGH"
+
+          "manual_action" = "Review the finding in Security Hub because automated IAM enrichment failed."
         }
+
         Next = "PlaybookFailed"
       }
+
 
       NotifyFailed = {
         Type     = "Task"
         Resource = var.write_audit_lambda_arn
-        Comment  = "Notification failed — write failure artifact and continue to remediation"
-        Parameters = {
-          "finding.$"  = "$.finding"
-          "error.$"    = "$.error"
-          "event_type" = "NOTIFICATION_FAILURE"
-        }
+        Comment  = "SOC notification failed; record available execution context before continuing remediation"
+
+        Retry = [{
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException"
+          ]
+          IntervalSeconds = 2
+          MaxAttempts     = 2
+          BackoffRate     = 2
+        }]
+
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          Next        = "RemediateIAM"
+          ResultPath  = "$.audit_error"
+        }]
+
         Next = "RemediateIAM"
       }
+
 
       RemediationFailed = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Automated remediation failed — escalate to SOC for manual action"
+        Comment  = "Automated IAM remediation failed; escalate to SOC for manual containment"
+
         Parameters = {
-          "finding.$"     = "$.finding"
-          "error.$"       = "$.error"
-          "alert_type"    = "REMEDIATION_FAILED"
-          "severity"      = "CRITICAL"
-          "manual_action" = "URGENT: Automated IAM remediation failed. Manually disable credentials for affected user."
+          "playbook.$" = "$.playbook"
+          "finding.$"  = "$.finding"
+          "error.$"    = "$.error"
+
+          "alert_type" = "REMEDIATION_FAILED"
+          "severity"   = "CRITICAL"
+
+          "manual_action" = "URGENT: Automated IAM remediation failed. Manually disable or contain credentials for the affected IAM user."
         }
+
         ResultPath = "$.escalation"
-        Next       = "WriteAuditArtifact"
+
+        Next = "WriteAuditArtifact"
       }
+
+
+      AuditWriteFailed = {
+        Type     = "Task"
+        Resource = var.notify_soc_lambda_arn
+        Comment  = "Audit artifact creation failed; notify SOC that execution evidence requires manual review"
+
+        Parameters = {
+          "playbook.$"    = "$.playbook"
+          "finding.$"     = "$.finding"
+          "audit_error.$" = "$.audit_error"
+
+          "alert_type" = "AUDIT_WRITE_FAILED"
+          "severity"   = "HIGH"
+
+          "manual_action" = "Review Step Functions and CloudWatch execution history because the S3 audit artifact could not be written."
+        }
+
+        Next = "PlaybookFailed"
+      }
+
+
+      PlaybookSucceeded = {
+        Type    = "Succeed"
+        Comment = "IAM credential compromise response workflow completed"
+      }
+
 
       PlaybookFailed = {
         Type  = "Fail"
         Error = "PlaybookExecutionFailed"
-        Cause = "SOAR playbook failed — see execution history for details"
+        Cause = "IAM credential compromise workflow requires manual review; see execution history for details"
       }
     }
   })
 
+
   # ─── EC2 ISOLATION PLAYBOOK ────────────────────────────────────────────────
-  # Playbook: Backdoor:EC2/C&CActivity.B or Trojan:EC2/BlackholeTraffic
-  # Flow: Enrich → Notify → Snapshot+Isolate → Choice → Audit
+  #
+  # Flow:
+  # Enrich → Notify → Initiate snapshots and restrict network access
+  # → Evaluate → Audit
+  #
+  # Failure paths:
+  # - Enrichment failure → SOC escalation → Fail
+  # - Notification failure → continue containment
+  # - Partial isolation → SOC escalation → Audit
+  # - Isolation exception → SOC escalation → Audit
+  # ──────────────────────────────────────────────────────────────────────────
 
   ec2_playbook_asl = jsonencode({
-    Comment = "SOAR Playbook: EC2 Instance Isolation — Malware / C2 Activity"
+    Comment = "SOAR Playbook: EC2 Instance Isolation for Malware or Command-and-Control Activity"
     StartAt = "EnrichFinding"
+
     States = {
+
       EnrichFinding = {
         Type     = "Task"
         Resource = var.enrich_finding_lambda_arn
-        Comment  = "Enrich finding with EC2 instance metadata, VPC, attached SGs, running processes"
+        Comment  = "Enrich finding with EC2 metadata, VPC, security groups, IAM profile, and EBS volume context"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "EnrichFailed"
           ResultPath  = "$.error"
         }]
-        ResultPath = "$.enriched"
-        Next       = "NotifySOC"
+
+        Next = "NotifySOC"
       }
+
 
       NotifySOC = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Alert SOC — include instance ID, VPC, finding type, and proposed isolation action"
+        Comment  = "Notify SOC with instance context and proposed containment action"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 2
           BackoffRate     = 1.5
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
-          ResultPath  = "$.notify_error"
+          ResultPath  = "$.notification_error"
           Next        = "IsolateEC2"
         }]
-        ResultPath = "$.notification"
-        Next       = "IsolateEC2"
+
+        Next = "IsolateEC2"
       }
+
 
       IsolateEC2 = {
         Type     = "Task"
         Resource = var.ec2_isolation_lambda_arn
-        Comment  = "1) Tag instance QUARANTINE_PENDING  2) Snapshot EBS volumes  3) Replace SG with deny-all quarantine group"
+        Comment  = "Tag instance for quarantine, initiate EBS snapshots, and replace security groups with a restrictive quarantine group"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException", "Lambda.AWSLambdaException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 10
           MaxAttempts     = 2
           BackoffRate     = 2
         }]
+
         Catch = [{
           ErrorEquals = ["States.ALL"]
           Next        = "IsolationFailed"
           ResultPath  = "$.error"
         }]
-        ResultPath = "$.isolation"
-        Next       = "CheckIsolationSuccess"
+
+        Next = "CheckIsolationStatus"
       }
 
-      CheckIsolationSuccess = {
+
+      CheckIsolationStatus = {
         Type    = "Choice"
-        Comment = "Verify all isolation steps completed — snapshot + SG replacement required"
-        Choices = [{
-          And = [
-            { Variable = "$.isolation.snapshot_created", BooleanEquals = true },
-            { Variable = "$.isolation.sg_replaced", BooleanEquals = true }
-          ]
-          Next = "WriteAuditArtifact"
-        }]
-        Default = "IsolationPartial"
+        Comment = "Evaluate the overall EC2 containment result returned by the isolation function"
+
+        Choices = [
+          {
+            Variable     = "$.isolation.status"
+            StringEquals = "SUCCESS"
+            Next         = "WriteAuditArtifact"
+          },
+          {
+            Variable     = "$.isolation.status"
+            StringEquals = "PARTIAL"
+            Next         = "IsolationPartial"
+          }
+        ]
+
+        Default = "IsolationFailed"
       }
+
 
       IsolationPartial = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Partial isolation — some steps failed. Notify SOC for manual completion."
+        Comment  = "EC2 containment completed only partially; notify SOC for manual completion"
+
         Parameters = {
-          "finding.$"     = "$.finding"
-          "isolation.$"   = "$.isolation"
-          "alert_type"    = "ISOLATION_PARTIAL"
-          "severity"      = "CRITICAL"
-          "manual_action" = "Review EC2 isolation steps — snapshot or SG replacement may be incomplete."
+          "playbook.$"  = "$.playbook"
+          "finding.$"   = "$.finding"
+          "enriched.$"  = "$.enriched"
+          "isolation.$" = "$.isolation"
+
+          "alert_type" = "ISOLATION_PARTIAL"
+          "severity"   = "CRITICAL"
+
+          "manual_action" = "Review EC2 containment results and manually complete any remaining isolation or investigation steps."
         }
+
         ResultPath = "$.escalation"
-        Next       = "WriteAuditArtifact"
+
+        Next = "WriteAuditArtifact"
       }
+
 
       WriteAuditArtifact = {
         Type     = "Task"
         Resource = var.write_audit_lambda_arn
-        Comment  = "Write forensic preservation evidence to S3 — snapshot IDs, SG changes, timeline"
+        Comment  = "Write structured EC2 response artifact to S3 including containment actions and snapshot identifiers"
+
         Retry = [{
-          ErrorEquals     = ["Lambda.ServiceException"]
+          ErrorEquals = [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.TooManyRequestsException"
+          ]
           IntervalSeconds = 2
           MaxAttempts     = 3
           BackoffRate     = 2
         }]
-        ResultPath = "$.audit"
-        Next       = "PlaybookSucceeded"
+
+        Catch = [{
+          ErrorEquals = ["States.ALL"]
+          Next        = "AuditWriteFailed"
+          ResultPath  = "$.audit_error"
+        }]
+
+        Next = "PlaybookSucceeded"
       }
 
-      PlaybookSucceeded = {
-        Type    = "Succeed"
-        Comment = "EC2 isolation playbook completed — instance quarantined, evidence preserved"
-      }
 
       EnrichFailed = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Enrichment failed — alert SOC with raw finding for manual triage"
+        Comment  = "Automated EC2 enrichment failed; notify SOC using available finding context"
+
         Parameters = {
-          "finding.$"     = "$.finding"
-          "error.$"       = "$.error"
-          "alert_type"    = "ENRICHMENT_FAILED"
-          "severity"      = "HIGH"
-          "manual_action" = "Manually review EC2 instance in GuardDuty console — automated enrichment failed."
+          "playbook.$" = "$.playbook"
+          "finding.$"  = "$.finding"
+          "error.$"    = "$.error"
+
+          "alert_type" = "ENRICHMENT_FAILED"
+          "severity"   = "HIGH"
+
+          "manual_action" = "Review the affected EC2 resource and GuardDuty finding because automated enrichment failed."
         }
+
         Next = "PlaybookFailed"
       }
+
 
       IsolationFailed = {
         Type     = "Task"
         Resource = var.notify_soc_lambda_arn
-        Comment  = "Full isolation failed — CRITICAL escalation, instance still exposed"
+        Comment  = "Automated EC2 containment failed; escalate immediately for manual isolation"
+
         Parameters = {
-          "finding.$"     = "$.finding"
-          "error.$"       = "$.error"
-          "alert_type"    = "ISOLATION_FAILED"
-          "severity"      = "CRITICAL"
-          "manual_action" = "URGENT: Automated EC2 isolation failed. Manually isolate instance immediately."
+          "playbook.$" = "$.playbook"
+          "finding.$"  = "$.finding"
+          "error.$"    = "$.error"
+
+          "alert_type" = "ISOLATION_FAILED"
+          "severity"   = "CRITICAL"
+
+          "manual_action" = "URGENT: Automated EC2 containment failed. Manually isolate the affected instance and review attached resources."
         }
+
         ResultPath = "$.escalation"
-        Next       = "WriteAuditArtifact"
+
+        Next = "WriteAuditArtifact"
       }
+
+
+      AuditWriteFailed = {
+        Type     = "Task"
+        Resource = var.notify_soc_lambda_arn
+        Comment  = "Audit artifact creation failed; notify SOC that execution evidence requires manual review"
+
+        Parameters = {
+          "playbook.$"    = "$.playbook"
+          "finding.$"     = "$.finding"
+          "audit_error.$" = "$.audit_error"
+
+          "alert_type" = "AUDIT_WRITE_FAILED"
+          "severity"   = "HIGH"
+
+          "manual_action" = "Review Step Functions and CloudWatch execution history because the S3 audit artifact could not be written."
+        }
+
+        Next = "PlaybookFailed"
+      }
+
+
+      PlaybookSucceeded = {
+        Type    = "Succeed"
+        Comment = "EC2 containment workflow completed and execution context recorded"
+      }
+
 
       PlaybookFailed = {
         Type  = "Fail"
         Error = "PlaybookExecutionFailed"
-        Cause = "EC2 isolation playbook failed — see execution history for details"
+        Cause = "EC2 containment workflow requires manual review; see execution history for details"
       }
     }
   })
 }
 
-# ─── IAM EXECUTION ROLE FOR STATE MACHINES ────────────────────────────────────
+
+# ─── IAM EXECUTION ROLE FOR STEP FUNCTIONS ────────────────────────────────────
 
 resource "aws_iam_role" "step_functions" {
   name = "${var.name_prefix}-sfn-execution-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
+
     Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "states.amazonaws.com" }
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+
+      Principal = {
+        Service = "states.amazonaws.com"
+      }
     }]
   })
 }
+
 
 resource "aws_iam_role_policy" "step_functions" {
   name = "${var.name_prefix}-sfn-execution-policy"
@@ -317,11 +542,16 @@ resource "aws_iam_role_policy" "step_functions" {
 
   policy = jsonencode({
     Version = "2012-10-17"
+
     Statement = [
       {
         Sid    = "InvokeLambdaFunctions"
         Effect = "Allow"
-        Action = ["lambda:InvokeFunction"]
+
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+
         Resource = [
           var.enrich_finding_lambda_arn,
           var.notify_soc_lambda_arn,
@@ -330,9 +560,11 @@ resource "aws_iam_role_policy" "step_functions" {
           var.write_audit_lambda_arn
         ]
       },
+
       {
         Sid    = "WriteExecutionLogs"
         Effect = "Allow"
+
         Action = [
           "logs:CreateLogDelivery",
           "logs:GetLogDelivery",
@@ -343,22 +575,27 @@ resource "aws_iam_role_policy" "step_functions" {
           "logs:DescribeResourcePolicies",
           "logs:DescribeLogGroups"
         ]
+
         Resource = "*"
       },
+
       {
         Sid    = "WriteXRayTraces"
         Effect = "Allow"
+
         Action = [
           "xray:PutTraceSegments",
           "xray:PutTelemetryRecords",
           "xray:GetSamplingRules",
           "xray:GetSamplingTargets"
         ]
+
         Resource = "*"
       }
     ]
   })
 }
+
 
 # ─── IAM ROLE FOR EVENTBRIDGE → STEP FUNCTIONS ────────────────────────────────
 
@@ -367,13 +604,18 @@ resource "aws_iam_role" "eventbridge_invoke_sfn" {
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
+
     Statement = [{
-      Action    = "sts:AssumeRole"
-      Effect    = "Allow"
-      Principal = { Service = "events.amazonaws.com" }
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+
+      Principal = {
+        Service = "events.amazonaws.com"
+      }
     }]
   })
 }
+
 
 resource "aws_iam_role_policy" "eventbridge_invoke_sfn" {
   name = "${var.name_prefix}-eventbridge-sfn-policy"
@@ -381,10 +623,15 @@ resource "aws_iam_role_policy" "eventbridge_invoke_sfn" {
 
   policy = jsonencode({
     Version = "2012-10-17"
+
     Statement = [{
       Sid    = "StartStateMachineExecution"
       Effect = "Allow"
-      Action = ["states:StartExecution"]
+
+      Action = [
+        "states:StartExecution"
+      ]
+
       Resource = [
         aws_sfn_state_machine.iam_playbook.arn,
         aws_sfn_state_machine.ec2_playbook.arn
@@ -392,6 +639,7 @@ resource "aws_iam_role_policy" "eventbridge_invoke_sfn" {
     }]
   })
 }
+
 
 # ─── STATE MACHINES ───────────────────────────────────────────────────────────
 
@@ -410,8 +658,11 @@ resource "aws_sfn_state_machine" "iam_playbook" {
     enabled = true
   }
 
-  tags = { Name = "${var.name_prefix}-iam-playbook" }
+  tags = {
+    Name = "${var.name_prefix}-iam-playbook"
+  }
 }
+
 
 resource "aws_sfn_state_machine" "ec2_playbook" {
   name       = "${var.name_prefix}-ec2-isolation"
@@ -428,5 +679,7 @@ resource "aws_sfn_state_machine" "ec2_playbook" {
     enabled = true
   }
 
-  tags = { Name = "${var.name_prefix}-ec2-playbook" }
+  tags = {
+    Name = "${var.name_prefix}-ec2-playbook"
+  }
 }
