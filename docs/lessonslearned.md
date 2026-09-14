@@ -9,13 +9,9 @@
   in multi-region or multi-account setups. Cost and storage growth need to 
   be modeled at design time, not discovered after deployment.
 
-- Terraform's native destroy does not reliably clean up versioned buckets 
-  at scale, since it has to enumerate and delete every version individually. 
-  This is a known limitation, not a misconfiguration, and needs to be 
-  designed around rather than treated as a Terraform bug.
+- Large numbers of retained object versions and delete markers can complicate Terraform teardown and prevent versioned bucket deletion. Resource lifecycle and teardown behavior need to be considered during design rather than treated as an infrastructure tooling problem after deployment.g.
 
-- Batch/lifecycle-based deletion (rather than relying on destroy alone) is 
-  required for versioned buckets at any meaningful scale.
+- At scale, lifecycle policies and batched cleanup provide a more manageable approach to version retention and teardown than relying on ad hoc deletion during environment destruction..
 
 ## Architectural takeaway
 Security controls like logging and versioning create long-term operational 
