@@ -18,7 +18,7 @@ shows current objects, masking the actual contents.
 2. **Delete all object versions and delete markers**
    Standard `aws s3 rm` or console deletion only removes current 
    versions. Every noncurrent version and delete marker must be removed 
-   explicitly. At scale, batched deletion (via script or aws s3api delete-objects) is more practical than one-by-one deletion and reduces the risk of long-running cleanup operations timing out..
+   explicitly. At scale, batched deletion (via script or aws s3api delete-objects) is more practical than one-by-one deletion and reduces the risk of long-running cleanup operations timing out.
 
 3. **Verify the bucket is fully empty**
    Confirm via `aws s3api list-object-versions` that both `Versions` 
